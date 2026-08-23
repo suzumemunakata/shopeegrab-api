@@ -106,7 +106,16 @@ app.get('/api/shopee-extract', async (req, res) => {
       });
     });
 
-    await page.goto(shopeeUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    // 'commit' jauh lebih longgar daripada 'domcontentloaded': cukup
+    // menunggu navigasi mulai diterima server tujuan, tidak menunggu
+    // SEMUA resource halaman (termasuk tracker/analytics pihak ketiga
+    // yang kadang bikin 'domcontentloaded' macet/timeout di halaman
+    // berat seperti Shopee). Timeout juga diperpanjang jadi 45 detik.
+    await page.goto(shopeeUrl, { waitUntil: 'commit', timeout: 45000 });
+    // Beri sedikit waktu tambahan supaya halaman & videonya sempat
+    // benar-benar termuat di background sebelum lanjut ke langkah
+    // berikutnya (tidak mem-block keras seperti 'domcontentloaded').
+    await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
 
     // Sejumlah halaman video baru memuat file videonya setelah video
     // di-tap/di-play. Best effort: coba mainkan elemen <video> pertama
@@ -123,7 +132,7 @@ app.get('/api/shopee-extract', async (req, res) => {
 
     const found = await Promise.race([
       videoResponsePromise,
-      new Promise((resolve) => setTimeout(() => resolve(null), 12000)),
+      new Promise((resolve) => setTimeout(() => resolve(null), 20000)),
     ]);
 
     // Ambil judul dari meta og:title / <title>, sebagai fallback pakai domain.
