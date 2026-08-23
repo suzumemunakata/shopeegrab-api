@@ -15,18 +15,26 @@
  *
  *   GET /api/shopee-extract?url=<link_video_shopee>
  *     -> buka link pakai Playwright (Chromium headless)
- *     -> tunggu & tangkap response yang content-type-nya video/*
- *        atau url-nya berakhiran .mp4 / .m3u8
- *     -> balikan JSON { title, duration, size, downloadUrl }
- *        (downloadUrl mengarah balik ke endpoint /api/download
- *        di server ini sendiri, BUKAN langsung ke CDN Shopee —
- *        supaya browser pengguna benar-benar mengunduh file,
- *        bukan cuma membuka video di tab baru)
+ *     -> tunggu & tangkap SEMUA response yang content-type-nya video/*
+ *        atau url-nya berakhiran .mp4 / .m3u8 (bisa lebih dari satu file
+ *        kalau Shopee menyediakan beberapa varian kualitas untuk video
+ *        yang sama)
+ *     -> balikan JSON { title, duration, qualities: [...] }, setiap
+ *        item qualities berisi { size, downloadUrl, streamUrl }, sudah
+ *        diurutkan dari ukuran file terbesar (kualitas tertinggi) ke
+ *        terkecil.
  *
  *   GET /api/download?src=<url_video_asli_terenkode>
  *     -> stream ulang file video dari src ke browser pengguna
  *        dengan header Content-Disposition: attachment supaya
- *        memicu dialog "Save As" / unduhan otomatis.
+ *        memicu dialog "Save As" / unduhan otomatis. Dipakai oleh
+ *        tombol "Simpan Video Tanpa Watermark" di frontend.
+ *
+ *   GET /api/stream?src=<url_video_asli_terenkode>
+ *     -> sama seperti /api/download, tapi TANPA header attachment
+ *        (dan mendukung Range request untuk seek/scrubbing), supaya
+ *        videonya bisa diputar langsung di elemen <video> pratinjau
+ *        pada halaman, bukan otomatis ke-download.
  *
  * PENTING — baca README.md sebelum deploy:
  *  - Pendekatan ini butuh diverifikasi & mungkin disesuaikan
@@ -95,15 +103,18 @@ app.get('/api/shopee-extract', async (req, res) => {
     });
     const page = await context.newPage();
 
-    // Promise yang selesai begitu ada response berupa file video.
-    const videoResponsePromise = new Promise((resolve) => {
-      page.on('response', (response) => {
-        const url = response.url();
-        const contentType = response.headers()['content-type'] || '';
-        if (contentType.startsWith('video/') || VIDEO_EXT_RE.test(url)) {
-          resolve({ url, contentType, sizeHeader: response.headers()['content-length'] });
-        }
-      });
+    // Kumpulkan SEMUA response berupa file video selama halaman dimuat
+    // (bukan cuma yang pertama ketemu) — supaya kalau Shopee mengirim
+    // beberapa varian kualitas untuk video yang sama, semuanya tertangkap.
+    const foundVideos = [];
+    const seenUrls = new Set();
+    page.on('response', (response) => {
+      const url = response.url();
+      const contentType = response.headers()['content-type'] || '';
+      if ((contentType.startsWith('video/') || VIDEO_EXT_RE.test(url)) && !seenUrls.has(url)) {
+        seenUrls.add(url);
+        foundVideos.push({ url, contentType, sizeHeader: response.headers()['content-length'] });
+      }
     });
 
     // 'commit' jauh lebih longgar daripada 'domcontentloaded': cukup
@@ -130,10 +141,21 @@ app.get('/api/shopee-extract', async (req, res) => {
       .catch(() => {});
     await page.click('video, [class*="play"], [aria-label*="play" i]', { timeout: 3000 }).catch(() => {});
 
-    const found = await Promise.race([
-      videoResponsePromise,
-      new Promise((resolve) => setTimeout(() => resolve(null), 20000)),
-    ]);
+    // Tunggu sampai 20 detik, sambil terus mengumpulkan video yang
+    // ketemu (lihat page.on('response', ...) di atas) — TIDAK berhenti
+    // begitu video pertama ketemu, supaya varian kualitas lain (kalau
+    // ada) juga sempat tertangkap. Kalau video pertama sudah ketemu
+    // lebih awal, tetap tunggu maksimal 4 detik tambahan saja (bukan
+    // full 20 detik) supaya responsnya tidak terasa lambat.
+    const deadline = Date.now() + 20000;
+    let extraWaitAfterFirst = null;
+    while (Date.now() < deadline) {
+      if (foundVideos.length > 0) {
+        if (extraWaitAfterFirst === null) { extraWaitAfterFirst = Date.now() + 4000; }
+        if (Date.now() > extraWaitAfterFirst) { break; }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
 
     // Ambil judul dari meta og:title / <title>, sebagai fallback pakai domain.
     const title = await page
@@ -155,25 +177,34 @@ app.get('/api/shopee-extract', async (req, res) => {
 
     await context.close();
 
-    if (!found) {
+    if (foundVideos.length === 0) {
       return res.status(404).json({
         error:
           'Tidak menemukan file video di halaman ini dalam batas waktu. Coba lagi, atau sesuaikan server.js (lihat komentar di bagian "best effort").',
       });
     }
 
-    const sizeLabel = found.sizeHeader
-      ? `${(Number(found.sizeHeader) / (1024 * 1024)).toFixed(1)} MB`
-      : null;
+    // Urutkan dari ukuran file terbesar (asumsi: kualitas tertinggi) ke
+    // terkecil. Video tanpa info ukuran (sizeHeader kosong) taruh di
+    // akhir supaya tidak mengacaukan urutan yang diketahui ukurannya.
+    const sorted = foundVideos.slice().sort((a, b) => {
+      const sa = a.sizeHeader ? Number(a.sizeHeader) : -1;
+      const sb = b.sizeHeader ? Number(b.sizeHeader) : -1;
+      return sb - sa;
+    });
+
+    const qualities = sorted.map((v) => ({
+      size: v.sizeHeader ? `${(Number(v.sizeHeader) / (1024 * 1024)).toFixed(1)} MB` : null,
+      // downloadUrl: dipakai tombol "Simpan Video" (memaksa unduhan).
+      downloadUrl: `${PUBLIC_BASE_URL}/api/download?src=${encodeURIComponent(v.url)}`,
+      // streamUrl: dipakai elemen <video> pratinjau (main inline, bukan unduh).
+      streamUrl: `${PUBLIC_BASE_URL}/api/stream?src=${encodeURIComponent(v.url)}`,
+    }));
 
     return res.json({
       title,
       duration: duration || null,
-      size: sizeLabel,
-      // Diarahkan ke endpoint /api/download di server ini sendiri, BUKAN
-      // langsung ke found.url — supaya browser pengguna benar-benar
-      // mengunduh filenya (lihat komentar di endpoint /api/download).
-      downloadUrl: `${PUBLIC_BASE_URL}/api/download?src=${encodeURIComponent(found.url)}`,
+      qualities,
     });
   } catch (err) {
     if (context) { await context.close().catch(() => {}); }
@@ -205,6 +236,52 @@ app.get('/api/download', async (req, res) => {
     if (len) { res.setHeader('Content-Length', len); }
 
     // Stream body upstream (Web ReadableStream) langsung ke response Express.
+    const reader = upstream.body.getReader();
+    req.on('close', () => reader.cancel().catch(() => {}));
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+    res.end();
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) { res.status(500).json({ error: 'Gagal streaming video: ' + err.message }); }
+  }
+});
+
+app.get('/api/stream', async (req, res) => {
+  const src = req.query.src;
+  if (!src) { return res.status(400).json({ error: 'Parameter "src" kosong.' }); }
+
+  let parsed;
+  try { parsed = new URL(src); } catch (e) { return res.status(400).json({ error: 'src tidak valid.' }); }
+  if (!/shopee|susercontent|sgp1\.cdn|akamaized/i.test(parsed.hostname)) {
+    return res.status(400).json({ error: 'Host src tidak diizinkan.' });
+  }
+
+  try {
+    // Teruskan header Range dari browser (dipakai <video> untuk seek /
+    // scrubbing) ke request upstream, supaya upstream juga membalas
+    // sebagian file saja (206 Partial Content) alih-alih seluruh file.
+    const upstreamHeaders = {};
+    if (req.headers.range) { upstreamHeaders['Range'] = req.headers.range; }
+
+    const upstream = await fetch(src, { headers: upstreamHeaders });
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({ error: 'Gagal mengambil video dari sumber asli.' });
+    }
+
+    res.status(upstream.status); // teruskan 200 atau 206 apa adanya
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    const len = upstream.headers.get('content-length');
+    if (len) { res.setHeader('Content-Length', len); }
+    const range = upstream.headers.get('content-range');
+    if (range) { res.setHeader('Content-Range', range); }
+    // SENGAJA tidak diberi header Content-Disposition di sini — supaya
+    // browser memutar videonya langsung (inline), bukan men-download.
+
     const reader = upstream.body.getReader();
     req.on('close', () => reader.cancel().catch(() => {}));
     while (true) {
