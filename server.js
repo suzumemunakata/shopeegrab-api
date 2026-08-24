@@ -19,16 +19,20 @@
  *        Shopee di halaman (content-type video/* atau url .mp4/.m3u8),
  *        DALAM URUTAN KEMUNCULAN ASLINYA (bukan diurutkan ukuran file —
  *        lihat catatan "Kenapa video watermark bisa muncul" di bawah).
- *     -> SEKALIGUS, best-effort: scan body JSON dari setiap response
- *        API yang lewat selama halaman dimuat, cari string URL video
+ *     -> SEKALIGUS, best-effort dari DUA sumber, cari string URL video
  *        yang tersimpan di field bernama semacam "source"/"original"/
- *        "nowatermark" dsb — beberapa platform video menyimpan link
- *        video "bersih" di data API-nya sendiri, terpisah dari file
- *        yang benar-benar diputar pemutar di halaman publik (yang
- *        watermark-nya kadang sudah dibakar langsung ke video untuk
- *        versi share/publik). Kandidat ini SPEKULATIF — server tidak
- *        bisa memastikan field itu memang ada / memang bersih, ini
- *        cuma percobaan tambahan, ditandai qualities[i].hint === 'nowm'
+ *        "nowatermark" dsb:
+ *          1. Body JSON dari setiap response API (XHR/fetch) yang lewat
+ *             selama halaman dimuat.
+ *          2. Data JSON yang "ditanam" langsung di HTML halaman awal
+ *             (pola umum di situs server-side-rendered): tag
+ *             <script type="application/json"> dan variabel global
+ *             semacam window.__NEXT_DATA__ / __INITIAL_STATE__ / dst.
+ *             (sumber #1 TIDAK menangkap ini karena response HTML awal
+ *             content-type-nya text/html, bukan application/json).
+ *        Kandidat ini SPEKULATIF — server tidak bisa memastikan field
+ *        itu memang ada / memang bersih dari watermark, ini cuma
+ *        percobaan tambahan, ditandai qualities[i].hint === 'nowm'
  *        supaya frontend memberi label "Coba Tanpa Watermark".
  *     -> balikan JSON { title, duration, qualities: [...] }, setiap
  *        item qualities berisi { size, downloadUrl, streamUrl, hint }.
@@ -37,20 +41,26 @@
  *
  * KENAPA VIDEO/HASIL DOWNLOAD BISA MASIH ADA WATERMARK SHOPEE:
  *   Kalau setelah update ini watermark MASIH muncul di preview maupun
- *   file yang terunduh, itu artinya file video yang dimuat pemutar
- *   Shopee di halaman publik memang SUDAH dibakar watermark-nya di
- *   sisi Shopee sendiri (bukan overlay CSS yang bisa dihilangkan lewat
- *   kode di sini) — persis video yang sama yang dilihat siapa pun yang
- *   membuka link itu langsung di browser biasa. Untuk kasus begini,
- *   satu-satunya jalan adalah menemukan sumber video "bersih" yang
- *   sesungguhnya (kalau memang ada) lewat inspeksi manual: buka link
- *   Shopee itu di Chrome desktop, F12 > tab Network > filter "Fetch/XHR"
- *   (BUKAN "Media"), putar videonya, lalu cari response JSON yang berisi
- *   data video (biasanya nama field mengandung kata "video"/"play"/
- *   "media") dan periksa apakah ada URL video LAIN di situ selain yang
- *   dipakai pemutar. Kalau ketemu, kirim ke saya nama field & contoh
- *   response-nya (redact info sensitif) supaya scoring di
- *   walkForVideoUrls() bisa disesuaikan supaya field itu diprioritaskan.
+ *   file yang terunduh (di kedua sumber di atas), kemungkinan besar
+ *   artinya SATU-SATUNYA file video yang bisa diakses publik untuk
+ *   video itu — baik lewat network sniffing maupun lewat data JSON di
+ *   halamannya sendiri — memang SUDAH dibakar watermark-nya di sisi
+ *   Shopee (bukan overlay CSS yang bisa dihilangkan lewat kode di
+ *   sini), dan kemungkinan besar TIDAK ADA sumber "bersih" alternatif
+ *   yang bisa ditemukan lewat teknik sniffing/scanning apa pun (server
+ *   ini sudah scan network response DAN data tertanam di HTML).
+ *
+ *   Kalau memang begitu, jalan yang tersisa BUKAN "mencari sumber
+ *   bersih" lagi, tapi "menghapus watermark dari video yang ada" secara
+ *   pemrosesan gambar/video — mis. pakai ffmpeg dengan filter `delogo`
+ *   untuk mengaburkan area logo watermark (biasanya di salah satu
+ *   pojok, ukuran & posisi tetap). Ini butuh tahu persis di mana posisi
+ *   & ukuran watermark-nya (dari screenshot video hasil download), dan
+ *   perlu tambahan ffmpeg + logika transcoding di endpoint
+ *   /api/download — belum diimplementasikan di file ini karena
+ *   posisi/ukuran watermark belum diketahui pasti. Kirim screenshot
+ *   videonya (atau timestamp video + posisi watermark di layar) supaya
+ *   ini bisa dikerjakan sebagai langkah selanjutnya.
  *
  *   GET /api/download?src=<url_video_asli_terenkode>
  *     -> stream ulang file video dari src ke browser pengguna
@@ -261,6 +271,49 @@ app.get('/api/shopee-extract', async (req, res) => {
       Promise.allSettled(pendingJsonParses),
       new Promise((resolve) => setTimeout(resolve, 3000)),
     ]);
+
+    // Best-effort TAMBAHAN: sejumlah situs (termasuk kemungkinan Shopee,
+    // yang lazimnya dibangun dengan server-side rendering) TIDAK mengirim
+    // data video lewat response JSON terpisah — datanya sudah "ditanam"
+    // langsung di dalam HTML halaman awal, biasanya lewat tag
+    // <script type="application/json"> (pola umum di framework seperti
+    // Next.js, `__NEXT_DATA__`) atau variabel global seperti
+    // `window.__INITIAL_STATE__`. Response HTML awal itu content-type-nya
+    // text/html, BUKAN application/json, jadi tidak pernah tertangkap oleh
+    // listener response di atas. Di sini kita scan langsung dari DOM/JS
+    // halaman yang sudah dimuat untuk menutup celah itu.
+    const inlineJsonBlobs = await page
+      .evaluate(() => {
+        const out = [];
+        document.querySelectorAll('script[type="application/json"]').forEach((el) => {
+          if (el.textContent && el.textContent.length < 2000000) { out.push(el.textContent); }
+        });
+        const globalNames = [
+          '__INITIAL_STATE__', '__NEXT_DATA__', '__NUXT__',
+          '__APOLLO_STATE__', '__PRELOADED_STATE__', '__SSR_DATA__',
+        ];
+        globalNames.forEach((name) => {
+          try {
+            if (window[name] !== undefined) { out.push(JSON.stringify(window[name])); }
+          } catch (e) { /* nilainya tidak bisa di-serialize (mis. circular ref) — lewati */ }
+        });
+        return out;
+      })
+      .catch(() => []);
+
+    for (const blob of inlineJsonBlobs) {
+      try {
+        const parsed = JSON.parse(blob);
+        const out = [];
+        walkForVideoUrls(parsed, '', out, 0);
+        for (const c of out) {
+          if (!seenJsonUrls.has(c.url)) {
+            seenJsonUrls.add(c.url);
+            jsonCandidates.push(c);
+          }
+        }
+      } catch (e) { /* bukan JSON valid — lewati */ }
+    }
 
     // Ambil judul dari meta og:title / <title>, sebagai fallback pakai domain.
     const title = await page
