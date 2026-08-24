@@ -15,52 +15,28 @@
  *
  *   GET /api/shopee-extract?url=<link_video_shopee>
  *     -> buka link pakai Playwright (Chromium headless)
- *     -> tunggu & tangkap video yang benar-benar dimuat oleh pemutar
+ *     -> tunggu video PERTAMA yang benar-benar dimuat oleh pemutar
  *        Shopee di halaman (content-type video/* atau url .mp4/.m3u8),
- *        DALAM URUTAN KEMUNCULAN ASLINYA (bukan diurutkan ukuran file —
- *        lihat catatan "Kenapa video watermark bisa muncul" di bawah).
- *     -> SEKALIGUS, best-effort dari DUA sumber, cari string URL video
- *        yang tersimpan di field bernama semacam "source"/"original"/
- *        "nowatermark" dsb:
- *          1. Body JSON dari setiap response API (XHR/fetch) yang lewat
- *             selama halaman dimuat.
- *          2. Data JSON yang "ditanam" langsung di HTML halaman awal
- *             (pola umum di situs server-side-rendered): tag
- *             <script type="application/json"> dan variabel global
- *             semacam window.__NEXT_DATA__ / __INITIAL_STATE__ / dst.
- *             (sumber #1 TIDAK menangkap ini karena response HTML awal
- *             content-type-nya text/html, bukan application/json).
- *        Kandidat ini SPEKULATIF — server tidak bisa memastikan field
- *        itu memang ada / memang bersih dari watermark, ini cuma
- *        percobaan tambahan, ditandai qualities[i].hint === 'nowm'
- *        supaya frontend memberi label "Coba Tanpa Watermark".
- *     -> balikan JSON { title, duration, qualities: [...] }, setiap
- *        item qualities berisi { size, downloadUrl, streamUrl, hint }.
- *        Kandidat dari JSON (kalau ada) ditaruh paling depan, disusul
- *        video yang disadap dari jaringan dalam urutan kemunculan asli.
+ *        lalu berhenti menunggu SEGERA setelah itu (dengan jeda sangat
+ *        singkat untuk menangkap varian kualitas lain kalau kebetulan
+ *        datang hampir bersamaan) — supaya responsnya cepat.
+ *     -> balikan JSON { title, duration, qualities: [...] }, item
+ *        PERTAMA di array `qualities` selalu video pertama yang
+ *        ditemukan (persis logika versi awal yang sudah terbukti
+ *        menghasilkan file TANPA watermark di test kamu sebelumnya).
  *
- * KENAPA VIDEO/HASIL DOWNLOAD BISA MASIH ADA WATERMARK SHOPEE:
- *   Kalau setelah update ini watermark MASIH muncul di preview maupun
- *   file yang terunduh (di kedua sumber di atas), kemungkinan besar
- *   artinya SATU-SATUNYA file video yang bisa diakses publik untuk
- *   video itu — baik lewat network sniffing maupun lewat data JSON di
- *   halamannya sendiri — memang SUDAH dibakar watermark-nya di sisi
- *   Shopee (bukan overlay CSS yang bisa dihilangkan lewat kode di
- *   sini), dan kemungkinan besar TIDAK ADA sumber "bersih" alternatif
- *   yang bisa ditemukan lewat teknik sniffing/scanning apa pun (server
- *   ini sudah scan network response DAN data tertanam di HTML).
- *
- *   Kalau memang begitu, jalan yang tersisa BUKAN "mencari sumber
- *   bersih" lagi, tapi "menghapus watermark dari video yang ada" secara
- *   pemrosesan gambar/video — mis. pakai ffmpeg dengan filter `delogo`
- *   untuk mengaburkan area logo watermark (biasanya di salah satu
- *   pojok, ukuran & posisi tetap). Ini butuh tahu persis di mana posisi
- *   & ukuran watermark-nya (dari screenshot video hasil download), dan
- *   perlu tambahan ffmpeg + logika transcoding di endpoint
- *   /api/download — belum diimplementasikan di file ini karena
- *   posisi/ukuran watermark belum diketahui pasti. Kirim screenshot
- *   videonya (atau timestamp video + posisi watermark di layar) supaya
- *   ini bisa dikerjakan sebagai langkah selanjutnya.
+ * RIWAYAT PENTING soal watermark (baca ini kalau nanti perlu debug
+ * ulang): sempat ada 1 ronde percobaan yang menambahkan "pemindaian
+ * JSON" untuk MENEBAK sumber video "bersih" tambahan (dari response API
+ * & dari data yang ditanam di HTML halaman). Fitur itu SUDAH DIHAPUS
+ * dari file ini karena terbukti jadi PENYEBAB watermark muncul: heuristik
+ * penebakannya kadang salah menangkap URL video LAIN (bukan video yang
+ * diminta pengguna) dan menaruhnya di urutan pertama, menggantikan video
+ * yang sebenarnya sudah benar. Pelajarannya: JANGAN tambahkan lagi teknik
+ * "menebak" sumber video tanpa cara memverifikasinya — attributi
+ * `downloadUrl`/`streamUrl` di sini SELALU berasal dari video yang
+ * benar-benar disadap dari jaringan saat pemutar Shopee memuat video
+ * yang diminta, tidak ada tebakan lain.
  *
  *   GET /api/download?src=<url_video_asli_terenkode>
  *     -> stream ulang file video dari src ke browser pengguna
@@ -111,46 +87,6 @@ function isShopeeUrl(raw) {
   }
 }
 
-// --- Scan JSON API responses untuk kandidat URL video "bersih" ---------
-// Lihat catatan panjang di komentar atas file ini ("KENAPA VIDEO/HASIL
-// DOWNLOAD BISA MASIH ADA WATERMARK"). Ini murni best-effort/heuristik.
-const KEY_HINT_SCORES = [
-  { re: /no.?watermark|nowm|clean|original|source|raw/i, score: 3 },
-  { re: /download/i, score: 2 },
-  { re: /video.?url|play.?url|play.?addr|media.?url|^\.src$|\.src$/i, score: 1 },
-];
-
-function scoreKeyPath(path) {
-  let best = 0;
-  for (const hint of KEY_HINT_SCORES) {
-    if (hint.re.test(path) && hint.score > best) best = hint.score;
-  }
-  // Field yang eksplisit menyebut "watermark" tanpa kata "no" di
-  // depannya kemungkinan justru versi BER-watermark — turunkan skornya
-  // supaya tidak dipilih duluan.
-  if (/watermark/i.test(path) && !/no.?watermark/i.test(path)) best -= 5;
-  return best;
-}
-
-function walkForVideoUrls(node, pathPrefix, out, depth) {
-  if (depth > 6 || node == null) return;
-  if (typeof node === 'string') {
-    if (VIDEO_EXT_RE.test(node) && /^https?:\/\//i.test(node)) {
-      out.push({ url: node, score: scoreKeyPath(pathPrefix) });
-    }
-    return;
-  }
-  if (Array.isArray(node)) {
-    node.forEach((item, i) => walkForVideoUrls(item, `${pathPrefix}[${i}]`, out, depth + 1));
-    return;
-  }
-  if (typeof node === 'object') {
-    for (const key of Object.keys(node)) {
-      walkForVideoUrls(node[key], `${pathPrefix}.${key}`, out, depth + 1);
-    }
-  }
-}
-
 // Satu browser instance dipakai ulang supaya lebih cepat & hemat memori
 // dibanding buka-tutup browser baru setiap request.
 let browserPromise = null;
@@ -181,46 +117,23 @@ app.get('/api/shopee-extract', async (req, res) => {
     });
     const page = await context.newPage();
 
-    // Kumpulkan SEMUA response berupa file video selama halaman dimuat
-    // (bukan cuma yang pertama ketemu), TETAP dalam urutan kemunculan
-    // aslinya — tidak diurutkan ulang berdasarkan ukuran file di sini,
-    // karena video besar yang lain (mis. video "lainnya buat kamu" yang
-    // ikut ter-autoplay di halaman) bisa saja bukan video yang diminta
-    // dan malah lebih besar ukurannya. Video pertama yang ditemukan
-    // untuk link yang diminta adalah kandidat paling dipercaya.
+    // Kumpulkan video yang benar-benar dimuat pemutar Shopee di halaman,
+    // DALAM URUTAN KEMUNCULAN ASLI. Item PERTAMA di array ini adalah
+    // video yang dipakai sebagai hasil utama (downloadUrl/streamUrl
+    // default) — persis logika versi awal yang sudah terbukti bersih
+    // dari watermark. Video tambahan (kalau ada varian kualitas lain
+    // yang datang hampir bersamaan) tetap ditangkap untuk daftar
+    // "Available Qualities", tapi TIDAK PERNAH menggantikan urutan
+    // video pertama sebagai default.
     const foundVideos = [];
     const seenUrls = new Set();
-    // Sekaligus, kumpulkan kandidat URL video "bersih" dari body JSON
-    // API yang lewat (lihat walkForVideoUrls & catatan panjang di atas).
-    const jsonCandidates = [];
-    const seenJsonUrls = new Set();
-    const pendingJsonParses = [];
 
     page.on('response', (response) => {
       const url = response.url();
       const contentType = response.headers()['content-type'] || '';
-
       if ((contentType.startsWith('video/') || VIDEO_EXT_RE.test(url)) && !seenUrls.has(url)) {
         seenUrls.add(url);
         foundVideos.push({ url, contentType, sizeHeader: response.headers()['content-length'] });
-        return;
-      }
-
-      if (contentType.includes('application/json')) {
-        const parsePromise = response
-          .json()
-          .then((body) => {
-            const out = [];
-            walkForVideoUrls(body, '', out, 0);
-            for (const c of out) {
-              if (!seenJsonUrls.has(c.url)) {
-                seenJsonUrls.add(c.url);
-                jsonCandidates.push(c);
-              }
-            }
-          })
-          .catch(() => {}); // body bukan JSON valid / response sudah tertutup — abaikan
-        pendingJsonParses.push(parsePromise);
       }
     });
 
@@ -248,71 +161,21 @@ app.get('/api/shopee-extract', async (req, res) => {
       .catch(() => {});
     await page.click('video, [class*="play"], [aria-label*="play" i]', { timeout: 3000 }).catch(() => {});
 
-    // Tunggu sampai 20 detik, sambil terus mengumpulkan video yang
-    // ketemu (lihat page.on('response', ...) di atas) — TIDAK berhenti
-    // begitu video pertama ketemu, supaya varian kualitas lain (kalau
-    // ada) juga sempat tertangkap. Kalau video pertama sudah ketemu
-    // lebih awal, tetap tunggu maksimal 4 detik tambahan saja (bukan
-    // full 20 detik) supaya responsnya tidak terasa lambat.
-    const deadline = Date.now() + 20000;
+    // Tunggu video pertama muncul (maks 15 detik untuk halaman yang
+    // lambat), lalu berhenti SEGERA dengan jeda singkat (900ms) untuk
+    // menangkap varian kualitas lain kalau kebetulan datang hampir
+    // bersamaan. Ini jauh lebih cepat dari versi sebelumnya (yang bisa
+    // menunggu sampai ~24 detik) — supaya responsnya terasa instan
+    // seperti situs pembanding, tanpa mengorbankan video pertama yang
+    // memang dipakai sebagai hasil utama.
+    const deadline = Date.now() + 15000;
     let extraWaitAfterFirst = null;
     while (Date.now() < deadline) {
       if (foundVideos.length > 0) {
-        if (extraWaitAfterFirst === null) { extraWaitAfterFirst = Date.now() + 4000; }
+        if (extraWaitAfterFirst === null) { extraWaitAfterFirst = Date.now() + 900; }
         if (Date.now() > extraWaitAfterFirst) { break; }
       }
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    }
-
-    // Body JSON response bisa masih diparse async setelah polling di atas
-    // selesai — beri jeda singkat (maks 3 detik) supaya jsonCandidates
-    // sempat terisi sebelum kita susun hasil akhirnya.
-    await Promise.race([
-      Promise.allSettled(pendingJsonParses),
-      new Promise((resolve) => setTimeout(resolve, 3000)),
-    ]);
-
-    // Best-effort TAMBAHAN: sejumlah situs (termasuk kemungkinan Shopee,
-    // yang lazimnya dibangun dengan server-side rendering) TIDAK mengirim
-    // data video lewat response JSON terpisah — datanya sudah "ditanam"
-    // langsung di dalam HTML halaman awal, biasanya lewat tag
-    // <script type="application/json"> (pola umum di framework seperti
-    // Next.js, `__NEXT_DATA__`) atau variabel global seperti
-    // `window.__INITIAL_STATE__`. Response HTML awal itu content-type-nya
-    // text/html, BUKAN application/json, jadi tidak pernah tertangkap oleh
-    // listener response di atas. Di sini kita scan langsung dari DOM/JS
-    // halaman yang sudah dimuat untuk menutup celah itu.
-    const inlineJsonBlobs = await page
-      .evaluate(() => {
-        const out = [];
-        document.querySelectorAll('script[type="application/json"]').forEach((el) => {
-          if (el.textContent && el.textContent.length < 2000000) { out.push(el.textContent); }
-        });
-        const globalNames = [
-          '__INITIAL_STATE__', '__NEXT_DATA__', '__NUXT__',
-          '__APOLLO_STATE__', '__PRELOADED_STATE__', '__SSR_DATA__',
-        ];
-        globalNames.forEach((name) => {
-          try {
-            if (window[name] !== undefined) { out.push(JSON.stringify(window[name])); }
-          } catch (e) { /* nilainya tidak bisa di-serialize (mis. circular ref) — lewati */ }
-        });
-        return out;
-      })
-      .catch(() => []);
-
-    for (const blob of inlineJsonBlobs) {
-      try {
-        const parsed = JSON.parse(blob);
-        const out = [];
-        walkForVideoUrls(parsed, '', out, 0);
-        for (const c of out) {
-          if (!seenJsonUrls.has(c.url)) {
-            seenJsonUrls.add(c.url);
-            jsonCandidates.push(c);
-          }
-        }
-      } catch (e) { /* bukan JSON valid — lewati */ }
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
     // Ambil judul dari meta og:title / <title>, sebagai fallback pakai domain.
@@ -335,50 +198,25 @@ app.get('/api/shopee-extract', async (req, res) => {
 
     await context.close();
 
-    if (foundVideos.length === 0 && jsonCandidates.length === 0) {
+    if (foundVideos.length === 0) {
       return res.status(404).json({
         error:
           'Tidak menemukan file video di halaman ini dalam batas waktu. Coba lagi, atau sesuaikan server.js (lihat komentar di bagian "best effort").',
       });
     }
 
-    // Susun daftar akhir: kandidat dari JSON (kalau skornya positif —
-    // artinya nama field-nya cocok pola "kemungkinan bersih") ditaruh
-    // PALING DEPAN sebagai percobaan, disusul video yang benar-benar
-    // disadap dari jaringan DALAM URUTAN KEMUNCULAN ASLI (bukan diurutkan
-    // ukuran — lihat catatan panjang di komentar atas file ini soal
-    // kenapa itu bisa memilih video yang salah/ber-watermark). Maksimal
-    // 2 kandidat JSON diambil supaya daftar kualitas tidak kebanjiran
-    // entri spekulatif.
-    jsonCandidates.sort((a, b) => b.score - a.score);
-    const topJsonCandidates = jsonCandidates.filter((c) => c.score > 0).slice(0, 2);
-
-    const addedUrls = new Set();
-    const qualities = [];
-
-    for (const c of topJsonCandidates) {
-      if (addedUrls.has(c.url)) continue;
-      addedUrls.add(c.url);
-      qualities.push({
-        size: null,
-        hint: 'nowm', // frontend memberi label "Coba Tanpa Watermark" untuk ini
-        downloadUrl: `${PUBLIC_BASE_URL}/api/download?src=${encodeURIComponent(c.url)}`,
-        streamUrl: `${PUBLIC_BASE_URL}/api/stream?src=${encodeURIComponent(c.url)}`,
-      });
-    }
-
-    for (const v of foundVideos) {
-      if (addedUrls.has(v.url)) continue;
-      addedUrls.add(v.url);
-      qualities.push({
-        size: v.sizeHeader ? `${(Number(v.sizeHeader) / (1024 * 1024)).toFixed(1)} MB` : null,
-        hint: null,
-        // downloadUrl: dipakai tombol "Simpan Video" (memaksa unduhan).
-        downloadUrl: `${PUBLIC_BASE_URL}/api/download?src=${encodeURIComponent(v.url)}`,
-        // streamUrl: dipakai elemen <video> pratinjau (main inline, bukan unduh).
-        streamUrl: `${PUBLIC_BASE_URL}/api/stream?src=${encodeURIComponent(v.url)}`,
-      });
-    }
+    // qualities[0] = video PERTAMA yang ditemukan (lihat catatan panjang
+    // di atas file ini). Video lain (kalau ada, ditemukan hampir
+    // bersamaan) disusul di belakang, tetap dalam urutan kemunculan asli
+    // — TIDAK diurutkan ulang berdasarkan ukuran file, supaya tidak ada
+    // risiko video lain menggantikan video pertama sebagai default.
+    const qualities = foundVideos.map((v) => ({
+      size: v.sizeHeader ? `${(Number(v.sizeHeader) / (1024 * 1024)).toFixed(1)} MB` : null,
+      // downloadUrl: dipakai tombol "Simpan Video" (memaksa unduhan).
+      downloadUrl: `${PUBLIC_BASE_URL}/api/download?src=${encodeURIComponent(v.url)}`,
+      // streamUrl: dipakai elemen <video> pratinjau (main inline, bukan unduh).
+      streamUrl: `${PUBLIC_BASE_URL}/api/stream?src=${encodeURIComponent(v.url)}`,
+    }));
 
     return res.json({
       title,
